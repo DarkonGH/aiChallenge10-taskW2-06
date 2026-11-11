@@ -25,6 +25,9 @@ type Agent struct {
 	onMessageStart func()
 	onContent      func(string)
 	onMessageDone  func()
+
+	noCompact        bool // demo mode: skip MaybeCompact, let the prompt overflow
+	lastAnswerTokens int  // completion tokens of the most recent model turn
 }
 
 // NewAgent wires a session, a tool set and a context compactor together.
@@ -58,6 +61,15 @@ func (a *Agent) SetStreamUI(onStart func(), onContent func(string), onDone func(
 	a.onMessageDone = onDone
 }
 
+// SetNoCompact disables automatic context compaction. Demo mode for day 8:
+// the prompt is allowed to grow past the budget so the overflow behavior
+// (and the eventual API failure) can be observed instead of hidden.
+func (a *Agent) SetNoCompact(v bool) { a.noCompact = v }
+
+// LastAnswerTokens reports the completion-token usage of the most recent
+// model turn (0 before the first turn).
+func (a *Agent) LastAnswerTokens() int { return a.lastAnswerTokens }
+
 func (a *Agent) tracef(format string, args ...any) {
 	if a.trace != nil {
 		a.trace(fmt.Sprintf(format, args...))
@@ -70,8 +82,10 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 	a.hist.AppendUser(userText)
 
 	for step := 1; step <= a.maxSteps; step++ {
-		if _, err := a.comp.MaybeCompact(ctx, a.hist.SystemPrompt()); err != nil {
-			a.tracef("сжатие контекста: %v", err)
+		if !a.noCompact {
+			if _, err := a.comp.MaybeCompact(ctx, a.hist.SystemPrompt()); err != nil {
+				a.tracef("сжатие контекста: %v", err)
+			}
 		}
 
 		messages := a.buildMessages()
@@ -94,6 +108,7 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 			return "", err
 		}
 		a.calib.Update(estimated, resp.Usage.PromptTokens)
+		a.lastAnswerTokens = resp.Usage.CompletionTokens
 
 		a.hist.AppendAssistant(resp.Content, resp.ToolCalls, a.hist.ChatModel())
 		if a.onMessageDone != nil {
