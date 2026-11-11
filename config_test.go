@@ -8,8 +8,8 @@ func TestDefaultModelFromEnv(t *testing.T) {
 	if got := DefaultModel(); got != "glm-5.3-flash" {
 		t.Fatalf("DefaultModel() = %q, want LLM_MODEL", got)
 	}
-	if got := DefaultSummaryModel(); got != "glm-5.3-flash" {
-		t.Fatalf("DefaultSummaryModel() = %q, want chat model fallback", got)
+	if got := DefaultSummaryModel(); got != "qwen3.8-27b" {
+		t.Fatalf("DefaultSummaryModel() = %q, want cheapest in roster (qwen3.8-27b)", got)
 	}
 
 	t.Setenv("LLM_SUMMARY_MODEL", "qwen3.8-27b")

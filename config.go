@@ -34,14 +34,22 @@ func DefaultModel() string {
 	return ModelSet[0].ID
 }
 
-// DefaultSummaryModel is used for compaction. LLM_SUMMARY_MODEL wins; otherwise
-// compaction runs on the same model as the chat, so a session never depends on
-// a second backend being up.
+// DefaultSummaryModel is used for compaction. LLM_SUMMARY_MODEL wins;
+// otherwise compaction runs on the cheapest model in the roster — it is a
+// service call and must cost less than the tokens it saves. If that model is
+// unavailable the compactor degrades gracefully: messages are archived and a
+// note is left, nothing is lost.
 func DefaultSummaryModel() string {
 	if m := strings.TrimSpace(os.Getenv("LLM_SUMMARY_MODEL")); m != "" {
 		return m
 	}
-	return DefaultModel()
+	cheapest := ModelSet[0]
+	for _, m := range ModelSet[1:] {
+		if m.RatePerM < cheapest.RatePerM {
+			cheapest = m
+		}
+	}
+	return cheapest.ID
 }
 
 // FindModel looks a model id up in the roster.

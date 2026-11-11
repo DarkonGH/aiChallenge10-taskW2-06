@@ -29,6 +29,7 @@ type Event struct {
 	Covers  []int64  `json:"covers,omitempty"`
 	Summary string   `json:"summary,omitempty"`
 	Model   string   `json:"model,omitempty"`
+	Role    string   `json:"role,omitempty"` // model_switch: пусто/"chat" — чат-модель, "summary" — модель сжатия
 }
 
 // History is one chat session backed by <dataDir>/<id>/session.jsonl.
@@ -182,7 +183,11 @@ func (h *History) apply(ev *Event) {
 		}
 	case "model_switch":
 		if ev.Model != "" {
-			h.chatModel = ev.Model
+			if ev.Role == "summary" {
+				h.summaryModel = ev.Model
+			} else {
+				h.chatModel = ev.Model
+			}
 		}
 	}
 }
@@ -263,6 +268,17 @@ func (h *History) SetChatModel(model string) {
 	}
 	h.chatModel = model
 	_ = h.writeEvent(Event{Type: "model_switch", Model: model})
+}
+
+// SetSummaryModel switches the compaction model and records the switch in the
+// log. Takes effect on the next compaction: the compactor reads
+// SummaryModel() at call time.
+func (h *History) SetSummaryModel(model string) {
+	if model == "" || model == h.summaryModel {
+		return
+	}
+	h.summaryModel = model
+	_ = h.writeEvent(Event{Type: "model_switch", Model: model, Role: "summary"})
 }
 
 // Active returns the prompt window, excluding the system prompt.
@@ -375,4 +391,56 @@ func LatestSession(dataDir string) (string, error) {
 		return "", fmt.Errorf("сессий пока нет")
 	}
 	return ids[0], nil
+}
+
+// SessionInfo is a one-line summary of a stored session for /session.
+type SessionInfo struct {
+	ID           string
+	Created      time.Time
+	ChatModel    string
+	SummaryModel string
+	Msgs         int
+}
+
+// SummarizeSessions lists sessions newest first with a little metadata,
+// read straight from the JSONL logs.
+func SummarizeSessions(dataDir string) ([]SessionInfo, error) {
+	ids, err := ListSessions(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SessionInfo, 0, len(ids))
+	for _, id := range ids {
+		info := SessionInfo{ID: id}
+		if b, err := os.ReadFile(filepath.Join(dataDir, id, "session.jsonl")); err == nil {
+			for _, line := range strings.Split(string(b), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				var ev Event
+				if json.Unmarshal([]byte(line), &ev) != nil {
+					continue
+				}
+				switch ev.Type {
+				case "session":
+					if ev.Created != nil {
+						info.Created = *ev.Created
+					}
+					info.ChatModel = ev.ChatModel
+					info.SummaryModel = ev.SummaryModel
+				case "message":
+					info.Msgs++
+				case "model_switch":
+					if ev.Role == "summary" {
+						info.SummaryModel = ev.Model
+					} else {
+						info.ChatModel = ev.Model
+					}
+				}
+			}
+		}
+		out = append(out, info)
+	}
+	return out, nil
 }
