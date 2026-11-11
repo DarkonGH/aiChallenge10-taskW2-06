@@ -165,6 +165,7 @@ func main() {
 	scriptFlag := flag.String("script", "", "проиграть запросы из файла и выйти")
 	listModels := flag.Bool("list-models", false, "показать список моделей и выйти")
 	listSessions := flag.Bool("list-sessions", false, "показать сохранённые сессии и выйти")
+	printSession := flag.String("print-session", "", "показать весь лог сессии и выйти (офлайн, без модели)")
 	flag.Parse()
 
 	dataDir := *dataFlag
@@ -178,6 +179,19 @@ func main() {
 	}
 	if *listSessions {
 		printSessions(dataDir)
+		return
+	}
+	if *printSession != "" {
+		id := *printSession
+		if id == "last" {
+			var err error
+			if id, err = LatestSession(dataDir); err != nil {
+				fatalf("%v", err)
+			}
+		}
+		if err := PrintSessionLog(dataDir, id, os.Stdout); err != nil {
+			fatalf("%v", err)
+		}
 		return
 	}
 
@@ -606,6 +620,9 @@ func printHelp() {
   /tokens          токены, архив, конспект, расходы API
   /compact         принудительно сжать контекст
   /recall <текст>  поиск по архиву
+
+Полный лог сессии (все сообщения, архив, сжатия) — из оболочки, офлайн:
+  ./task2-06 -print-session <id|last>
 
 Ввод: ↑/↓ — история запросов (хранится между запусками), ←/→ — курсор,
 Backspace, Ctrl-A/E — начало/конец строки, Ctrl-U/W — стереть строку/слово,

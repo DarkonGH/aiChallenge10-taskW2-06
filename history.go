@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -443,4 +444,106 @@ func SummarizeSessions(dataDir string) ([]SessionInfo, error) {
 		out = append(out, info)
 	}
 	return out, nil
+}
+
+// PrintSessionLog writes the whole session log to w in chronological order:
+// messages with full text, compactions and model switches. It only reads the
+// JSONL from disk — no network, no credentials, no model — so it works offline.
+func PrintSessionLog(dataDir, id string, w io.Writer) error {
+	path := filepath.Join(dataDir, id, "session.jsonl")
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("нет сессии %q в %s (список: -list-sessions)", id, dataDir)
+		}
+		return err
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	var events []Event
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var ev Event
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			continue // a torn last line is no reason to fail the whole dump
+		}
+		events = append(events, ev)
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+
+	// Header shows the models the session ended with, not the ones it started
+	// with: switches are replayed in the same pass as the body.
+	var created *time.Time
+	chat, summary := "", ""
+	for _, ev := range events {
+		switch ev.Type {
+		case "session":
+			created = ev.Created
+			chat, summary = ev.ChatModel, ev.SummaryModel
+		case "model_switch":
+			if ev.Role == "summary" {
+				summary = ev.Model
+			} else {
+				chat = ev.Model
+			}
+		}
+	}
+	when := ""
+	if created != nil {
+		when = " · " + created.Format("02.01 15:04")
+	}
+	fmt.Fprintf(w, "сессия %s%s · модель %s · сжатие %s\n\n", id, when, chat, summary)
+
+	msgs := 0
+	for _, ev := range events {
+		switch ev.Type {
+		case "model_switch":
+			what := "чат-модель"
+			if ev.Role == "summary" {
+				what = "модель сжатия"
+			}
+			fmt.Fprintf(w, "       — %s: %s\n", what, ev.Model)
+		case "compact":
+			if len(ev.Covers) == 2 {
+				fmt.Fprintf(w, "       — сжатие: seq %d..%d → архив, конспект ~%d ток.\n",
+					ev.Covers[0], ev.Covers[1], EstimateTokens(ev.Summary))
+			}
+		case "message":
+			if ev.Message == nil {
+				continue
+			}
+			msgs++
+			printLogMessage(w, ev.Message)
+		}
+	}
+	fmt.Fprintf(w, "\nвсего сообщений: %d\n", msgs)
+	return nil
+}
+
+// printLogMessage renders one stored message without truncating its text.
+func printLogMessage(w io.Writer, m *Message) {
+	text := strings.TrimRight(m.Content, "\n")
+	switch {
+	case len(m.ToolCalls) > 0:
+		for _, tc := range m.ToolCalls {
+			fmt.Fprintf(w, "[%3d] %-9s → %s(%s)\n", m.Seq, m.Role, tc.Function.Name, oneLine(tc.Function.Arguments))
+		}
+	case m.Role == "tool":
+		name := m.Name
+		if name == "" {
+			name = "tool"
+		}
+		fmt.Fprintf(w, "[%3d] %-9s ← %s: %s\n", m.Seq, m.Role, name, text)
+	case text == "":
+		fmt.Fprintf(w, "[%3d] %-9s\n", m.Seq, m.Role)
+	default:
+		fmt.Fprintf(w, "[%3d] %-9s %s\n", m.Seq, m.Role, text)
+	}
 }

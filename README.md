@@ -21,11 +21,19 @@ export OPENAI_API_KEY="..."
 ./task2-06 -list-models
 ./task2-06 -list-sessions
 ./task2-06 -continue     # продолжить последнюю сессию
+./task2-06 -print-session 20261111-204115-1820   # весь лог сессии, офлайн
+./task2-06 -print-session last                   # то же для последней
 ```
+
+`-print-session` читает только `session.jsonl` с диска: ни сети, ни ключей,
+ни модели не нужно. Печатает хронологически все сообщения полным текстом,
+вызовы инструментов (`→ calc(...)`, `← calc: 4`), события сжатия и смены
+моделей; в заголовке — модели, с которыми сессия закончила.
 
 Флаги: `-model`, `-summary-model`, `-session`, `-continue`, `-data`,
 `-max-steps`, `-max-prompt-tokens`, `-reserve-output`, `-min-tail-tokens`,
-`-max-tool-chars`, `-temperature`, `-max-tokens`, `-system`, `-script`.
+`-max-tool-chars`, `-temperature`, `-max-tokens`, `-system`, `-script`,
+`-print-session`.
 Модели по умолчанию берутся из `LLM_MODEL` / `LLM_SUMMARY_MODEL`.
 `run.sh` сам подхватывает `~/.env`, если переменные не экспортированы.
 

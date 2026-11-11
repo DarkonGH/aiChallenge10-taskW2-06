@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -155,5 +156,47 @@ func TestSummaryModelSwitchPersists(t *testing.T) {
 	}
 	if infos[0].ChatModel != "model-a" || infos[0].SummaryModel != "model-s2" {
 		t.Errorf("info models = %q/%q, want model-a/model-s2", infos[0].ChatModel, infos[0].SummaryModel)
+	}
+}
+
+func TestPrintSessionLogOffline(t *testing.T) {
+	dir := t.TempDir()
+
+	h, err := OpenHistory(dir, "s-log", "chat-m", "sum-m", "sys")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	h.AppendUser("привет")
+	h.AppendAssistant("", []ToolCall{call("calc", `{"expr":"2+2"}`)}, "chat-m")
+	h.AppendTool("call_1", "calc", "4")
+	h.AppendAssistant("ответ\nвторая строка", nil, "chat-m")
+	h.SetSummaryModel("sum-m2")
+	if err := h.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	var b strings.Builder
+	if err := PrintSessionLog(dir, "s-log", &b); err != nil {
+		t.Fatalf("print: %v", err)
+	}
+	out := b.String()
+	for _, want := range []string{
+		"сессия s-log",
+		"модель chat-m",
+		"сжатие sum-m2",
+		"модель сжатия: sum-m2",
+		"[  1] user      привет",
+		"→ calc(",
+		"← calc: 4",
+		"вторая строка",
+		"всего сообщений: 4",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output misses %q:\n%s", want, out)
+		}
+	}
+
+	if err := PrintSessionLog(dir, "no-such", &b); err == nil {
+		t.Error("expected an error for a missing session")
 	}
 }
