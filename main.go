@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,11 +25,131 @@ type app struct {
 
 	hist  *History
 	agent *Agent
+	ui    *ui
+}
+
+// ui owns the single "status line" under the prompt: the one-character
+// spinner and the trace lines (tool calls, compaction notices) share it, so
+// every write is serialized through one mutex. Streamed answer deltas also go
+// through it: the first token stops the spinner, and every consumer that
+// prints a full line closes the streamed line first.
+type ui struct {
+	mu        sync.Mutex
+	tty       bool
+	spinning  bool
+	streamed  bool // a streamed answer fragment is on screen, line not closed
+	sawStream bool // any answer text was streamed during the current ask turn
+}
+
+const spinLine = "  / "
+
+// spinFrames is the one-character spinner: / - \ |, one cell, in place.
+const spinFrames = "/-\\|"
+
+// begin starts the spinner. It returns a stop channel (nil when the spinner
+// is off); waiting on it guarantees the line is cleared before the next print.
+func (u *ui) begin(done <-chan struct{}) <-chan struct{} {
+	if !u.tty {
+		return nil
+	}
+	stop := make(chan struct{})
+	u.mu.Lock()
+	u.spinning = true
+	u.mu.Unlock()
+	go func() {
+		defer close(stop)
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				u.mu.Lock()
+				if u.spinning {
+					fmt.Print("\r" + strings.Repeat(" ", len(spinLine)) + "\r")
+					u.spinning = false
+				}
+				u.mu.Unlock()
+				return
+			case <-time.After(130 * time.Millisecond):
+				u.mu.Lock()
+				if u.spinning {
+					fmt.Printf("\r  %s ", string(spinFrames[i%len(spinFrames)]))
+				}
+				u.mu.Unlock()
+			}
+		}
+	}()
+	return stop
+}
+
+// rearm turns the spinner back on before the next model request (the painting
+// goroutine from begin() keeps running until done is closed).
+func (u *ui) rearm() {
+	if !u.tty {
+		return
+	}
+	u.mu.Lock()
+	u.spinning = true
+	u.mu.Unlock()
+}
+
+// beginTurn marks the start of one ask() turn: nothing streamed yet.
+func (u *ui) beginTurn() {
+	u.mu.Lock()
+	u.streamed = false
+	u.sawStream = false
+	u.mu.Unlock()
+}
+
+// content prints a streamed piece of the assistant answer, stopping the
+// spinner on the first visible token.
+func (u *ui) content(s string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.spinning {
+		fmt.Print("\r" + strings.Repeat(" ", len(spinLine)) + "\r")
+		u.spinning = false
+	}
+	u.streamed = true
+	u.sawStream = true
+	fmt.Print(s)
+}
+
+// endLine closes a streamed line if one is open and reports whether it did.
+func (u *ui) endLine() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.streamed {
+		fmt.Println()
+		u.streamed = false
+		return true
+	}
+	return false
+}
+
+// didStream reports whether answer text was streamed in the current turn.
+func (u *ui) didStream() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.sawStream
+}
+
+// trace prints a tool/compaction line, wiping the spinner frame first and
+// closing an unterminated streamed line.
+func (u *ui) trace(s string) {
+	u.mu.Lock()
+	if u.spinning {
+		fmt.Print("\r" + strings.Repeat(" ", len(spinLine)) + "\r")
+	}
+	if u.streamed {
+		fmt.Println()
+		u.streamed = false
+	}
+	fmt.Println("  ↳ " + s)
+	u.mu.Unlock()
 }
 
 func main() {
 	modelFlag := flag.String("model", "", "чат-модель (по умолчанию LLM_MODEL или deepseek-v4.1-flash)")
-	summaryFlag := flag.String("summary-model", "", "модель для сжатия контекста (по умолчанию LLM_SUMMARY_MODEL или чат-модель)")
+	summaryFlag := flag.String("summary-model", "", "модель для сжатия контекста (по умолчанию LLM_SUMMARY_MODEL или самая дешёвая в списке)")
 	sessionFlag := flag.String("session", "", "id сессии")
 	continueFlag := flag.Bool("continue", false, "продолжить последнюю сессию")
 	dataFlag := flag.String("data", "", "каталог сессий")
@@ -42,8 +163,9 @@ func main() {
 	maxToolChars := flag.Int("max-tool-chars", 800, "сколько символов результата инструмента оставлять в промпте")
 	systemFlag := flag.String("system", "", "файл с системным промптом")
 	scriptFlag := flag.String("script", "", "проиграть запросы из файла и выйти")
-	listModels := flag.Bool("list-models", false, "показать ростер моделей и выйти")
+	listModels := flag.Bool("list-models", false, "показать список моделей и выйти")
 	listSessions := flag.Bool("list-sessions", false, "показать сохранённые сессии и выйти")
+	printSession := flag.String("print-session", "", "показать весь лог сессии и выйти (офлайн, без модели)")
 	flag.Parse()
 
 	dataDir := *dataFlag
@@ -57,6 +179,19 @@ func main() {
 	}
 	if *listSessions {
 		printSessions(dataDir)
+		return
+	}
+	if *printSession != "" {
+		id := *printSession
+		if id == "last" {
+			var err error
+			if id, err = LatestSession(dataDir); err != nil {
+				fatalf("%v", err)
+			}
+		}
+		if err := PrintSessionLog(dataDir, id, os.Stdout); err != nil {
+			fatalf("%v", err)
+		}
 		return
 	}
 
@@ -89,6 +224,7 @@ func main() {
 		maxSteps:     *maxSteps,
 		temperature:  *temp,
 		maxToolChars: *maxToolChars,
+		ui:           &ui{tty: isTerminal(os.Stdout)},
 	}
 
 	sessionID := *sessionFlag
@@ -124,28 +260,25 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	}
 	a.hist = h
 	a.agent = NewAgent(a.client, a.tools, h, a.budget, a.maxSteps, a.temperature, a.maxToolChars)
-	a.agent.SetTrace(func(s string) { fmt.Println("  ↳ " + s) })
+	a.agent.SetTrace(a.ui.trace)
+	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
 	return nil
 }
 
 func (a *app) repl() {
-	interactive := isTerminal(os.Stdin)
-	fmt.Printf("сессия %s · модель %s\n/help — команды, /exit — выход\n", a.hist.ID(), a.hist.ChatModel())
+	fmt.Printf("сессия %s · модель %s · сжатие %s\n/help — команды: /model — модель, /session — сессия, /exit — выход; статистика — после каждого ответа\n", a.hist.ID(), a.hist.ChatModel(), a.hist.SummaryModel())
 	if envModel := strings.TrimSpace(os.Getenv("LLM_MODEL")); envModel != "" && envModel != a.hist.ChatModel() {
 		fmt.Printf("внимание: сессия сохранена с моделью %s, а LLM_MODEL=%s; переключить: /model %s\n",
 			a.hist.ChatModel(), envModel, envModel)
 	}
-	sc := bufio.NewScanner(os.Stdin)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
+	ed := newLineEditor(isTerminal(os.Stdin), filepath.Join(a.dataDir, "history"))
 	for {
-		if interactive {
-			fmt.Print("\nagent> ")
-		}
-		if !sc.Scan() {
+		line, err := ed.read("agent> ")
+		if err != nil {
 			break
 		}
-		line := strings.TrimSpace(sc.Text())
+		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
@@ -168,9 +301,34 @@ func (a *app) ask(text string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	// A reasoning model can think for a while before the first byte, so show
-	// that the process is alive instead of looking frozen.
 	done := make(chan struct{})
+	a.ui.beginTurn()
+
+	if a.ui.tty {
+		// One-character spinner on the line under the prompt; the streamed
+		// answer replaces it as soon as the first token arrives.
+		stop := a.ui.begin(done)
+		answer, err := a.agent.Chat(ctx, text)
+		close(done)
+		if stop != nil {
+			<-stop
+		}
+		streamed := a.ui.didStream()
+		a.ui.endLine()
+		if err != nil {
+			fmt.Println("ошибка:", err)
+			return
+		}
+		if !streamed {
+			fmt.Println()
+			fmt.Println(answer)
+		}
+		a.footer()
+		return
+	}
+
+	// Non-TTY (script mode): no spinner, deltas still stream to stdout; the
+	// ticker only speaks while nothing has arrived yet.
 	go func() {
 		t := time.NewTicker(10 * time.Second)
 		defer t.Stop()
@@ -180,6 +338,9 @@ func (a *app) ask(text string) {
 			case <-done:
 				return
 			case <-t.C:
+				if a.ui.didStream() {
+					continue
+				}
 				fmt.Printf("  … ждём ответа (%d с)\n", int(time.Since(start).Seconds()))
 			}
 		}
@@ -187,12 +348,32 @@ func (a *app) ask(text string) {
 
 	answer, err := a.agent.Chat(ctx, text)
 	close(done)
+	streamed := a.ui.didStream()
+	a.ui.endLine()
 	if err != nil {
 		fmt.Println("ошибка:", err)
 		return
 	}
-	fmt.Println()
-	fmt.Println(answer)
+	if !streamed {
+		fmt.Println()
+		fmt.Println(answer)
+	}
+	a.footer()
+}
+
+// footer is the one-line stats line printed after every turn: model, prompt
+// estimate vs budget, active/archive split and accumulated API cost.
+func (a *app) footer() {
+	activeMsgs, _, archivedMsgs, _ := a.hist.Stats()
+	extra := ""
+	if a.hist.HasSummary() {
+		extra = fmt.Sprintf(" · конспект ~%d ток", EstimateTokens(a.hist.SummaryText()))
+	}
+	s := a.client.Stats()
+	fmt.Printf("· %s · промпт ~%d/%d ток · актив %d, архив %d сообщ%s · API %d выз., $%.4f\n",
+		a.hist.ChatModel(),
+		a.agent.comp.PromptTokens(a.hist.SystemPrompt()), a.budget.MaxPromptTokens,
+		activeMsgs, archivedMsgs, extra, s.Calls, s.Cost)
 }
 
 func (a *app) command(line string) (bool, error) {
@@ -215,13 +396,41 @@ func (a *app) command(line string) (bool, error) {
 		fmt.Println("новая сессия:", a.hist.ID())
 
 	case "/session":
-		fmt.Printf("сессия: %s\nфайл: %s\nчат-модель: %s\nмодель сжатия: %s\n",
-			a.hist.ID(), a.hist.Path(), a.hist.ChatModel(), a.hist.SummaryModel())
+		if arg == "" {
+			a.printSessionList()
+			return false, nil
+		}
+		id := arg
+		infos, err := SummarizeSessions(a.dataDir)
+		if err != nil {
+			return false, err
+		}
+		exists := false
+		for _, inf := range infos {
+			if inf.ID == id {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			return false, fmt.Errorf("нет сессии %s; /session без аргумента — список сессий", id)
+		}
+		if id == a.hist.ID() {
+			fmt.Println("уже в этой сессии:", id)
+			return false, nil
+		}
+		if err := a.newSession(id, "", ""); err != nil {
+			return false, err
+		}
+		activeMsgs, _, archivedMsgs, _ := a.hist.Stats()
+		fmt.Printf("сессия: %s · модель %s · сжатие %s · сообщений %d (актив %d, архив %d)\n",
+			a.hist.ID(), a.hist.ChatModel(), a.hist.SummaryModel(), activeMsgs+archivedMsgs, activeMsgs, archivedMsgs)
 
 	case "/model":
 		if arg == "" {
 			printModels()
-			fmt.Println("текущая:", a.hist.ChatModel())
+			fmt.Println("текущая чат-модель:", a.hist.ChatModel())
+			fmt.Printf("переключить: /model <id>, например /model %s\n", ModelSet[0].ID)
 			return false, nil
 		}
 		if _, ok := FindModel(arg); !ok {
@@ -229,6 +438,23 @@ func (a *app) command(line string) (bool, error) {
 		}
 		a.hist.SetChatModel(arg)
 		fmt.Println("чат-модель:", arg)
+
+	case "/summary":
+		if arg == "" {
+			printModels()
+			fmt.Println("текущая модель сжатия:", a.hist.SummaryModel())
+			fmt.Println("переключить: /summary <id>; вступит в силу со следующего сжатия, /compact — сжать сейчас")
+			return false, nil
+		}
+		if _, ok := FindModel(arg); !ok {
+			return false, fmt.Errorf("неизвестная модель %q; доступны: %s", arg, strings.Join(ModelIDs(), ", "))
+		}
+		if arg == a.hist.SummaryModel() {
+			fmt.Println("модель сжатия уже:", arg)
+			return false, nil
+		}
+		a.hist.SetSummaryModel(arg)
+		fmt.Println("модель сжатия:", arg, "— вступит в силу со следующего сжатия (/compact — сжать сейчас)")
 
 	case "/system":
 		fmt.Println(a.hist.SystemPrompt())
@@ -304,6 +530,7 @@ func (a *app) printTokens() {
 	}
 	fmt.Printf("оценка промпта: ~%d ток. (бюджет %d, калибровка ×%.2f)\n",
 		a.agent.comp.PromptTokens(a.hist.SystemPrompt()), a.budget.MaxPromptTokens, a.agent.calib.Ratio())
+	fmt.Printf("модель сжатия: %s\n", a.hist.SummaryModel())
 
 	s := a.client.Stats()
 	fmt.Printf("API: %d вызовов, промпт %d, ответ %d, всего %d ток., $%.4f\n",
@@ -330,8 +557,30 @@ func (a *app) runScript(path string) error {
 	return sc.Err()
 }
 
+// printSessionList shows all stored sessions with the current one marked.
+func (a *app) printSessionList() {
+	infos, err := SummarizeSessions(a.dataDir)
+	if err != nil {
+		fmt.Println("ошибка:", err)
+		return
+	}
+	if len(infos) == 0 {
+		fmt.Println("сессий пока нет")
+		return
+	}
+	fmt.Println("сессии (сначала новые):")
+	for _, inf := range infos {
+		mark := " "
+		if inf.ID == a.hist.ID() {
+			mark = "*"
+		}
+		fmt.Printf(" %s %s · %s · модель %s · сжатие %s\n", mark, inf.ID, inf.Created.Format("02.01 15:04"), inf.ChatModel, inf.SummaryModel)
+	}
+	fmt.Println("* — текущая; переключиться: /session <id>")
+}
+
 func printModels() {
-	fmt.Println("Модели:")
+	fmt.Println("Модели — id это имя в первом столбце:")
 	for _, m := range ModelSet {
 		mark := " "
 		if m.ID == DefaultModel() {
@@ -343,16 +592,17 @@ func printModels() {
 }
 
 func printSessions(dataDir string) {
-	ids, err := ListSessions(dataDir)
+	infos, err := SummarizeSessions(dataDir)
 	if err != nil {
 		fatalf("%v", err)
 	}
-	if len(ids) == 0 {
+	if len(infos) == 0 {
 		fmt.Println("сессий пока нет")
 		return
 	}
-	for _, id := range ids {
-		fmt.Println(id)
+	for _, inf := range infos {
+		fmt.Printf("%s · %s · модель %s · сжатие %s · сообщений %d\n",
+			inf.ID, inf.Created.Format("02.01 15:04"), inf.ChatModel, inf.SummaryModel, inf.Msgs)
 	}
 }
 
@@ -361,14 +611,22 @@ func printHelp() {
   /help            эта справка
   /exit            выход (также /quit)
   /new             новая сессия
-  /session         id, файл, модели
-  /model [id]      показать ростер или переключить чат-модель
+  /session [id]    список сессий или переключение на сессию
+  /model [id]      список моделей или смена чат-модели
+  /summary [id]    модель сжатия: список или смена
   /system          показать системный промпт
   /tools           список инструментов
   /history         последние сообщения активного окна
   /tokens          токены, архив, конспект, расходы API
   /compact         принудительно сжать контекст
   /recall <текст>  поиск по архиву
+
+Полный лог сессии (все сообщения, архив, сжатия) — из оболочки, офлайн:
+  ./task2-06 -print-session <id|last>
+
+Ввод: ↑/↓ — история запросов (хранится между запусками), ←/→ — курсор,
+Backspace, Ctrl-A/E — начало/конец строки, Ctrl-U/W — стереть строку/слово,
+Ctrl-C — отменить ввод, Ctrl-D — выход.
 
 Всё остальное отправляется модели.
 `)

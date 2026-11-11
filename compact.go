@@ -4,7 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
+
+// summaryAttemptTimeout bounds one summarizer request. Without it a hung
+// summary model eats the caller's whole deadline (180 s in ask), and the
+// fallback model never gets a chance to run.
+var summaryAttemptTimeout = 75 * time.Second
 
 // Budget is the token budget of the prompt window.
 type Budget struct {
@@ -121,8 +127,8 @@ func (c *Compactor) ForceCompact(ctx context.Context, system string) (bool, erro
 		return false, err
 	}
 	if c.trace != nil {
-		c.trace(fmt.Sprintf("контекст сжат: %d сообщений → архив, конспект ~%d ток.",
-			len(prefix), EstimateTokens(summary)))
+		c.trace(fmt.Sprintf("сжатие контекста: сообщения seq %d..%d → архив, конспект ~%d ток., промпт теперь ~%d ток.",
+			from, to, EstimateTokens(summary), c.PromptTokens(system)))
 	}
 	return true, nil
 }
@@ -154,9 +160,9 @@ func (c *Compactor) splitIndex(msgs []*Message) int {
 	return best
 }
 
-// summarize folds the previous summary and the archived prefix into one short
-// note using the cheap summary model.
-func (c *Compactor) summarize(ctx context.Context, prefix []*Message) (string, error) {
+// summarizePrompt builds the summarizer input: the previous summary plus the
+// messages that are leaving the prompt.
+func (c *Compactor) summarizePrompt(prefix []*Message) string {
 	var b strings.Builder
 	if c.hist.HasSummary() {
 		b.WriteString("Предыдущий конспект:\n")
@@ -179,21 +185,62 @@ func (c *Compactor) summarize(ctx context.Context, prefix []*Message) (string, e
 			fmt.Fprintf(&b, "  результат %s: %s\n", m.Name, truncate(m.Content, 400))
 		}
 	}
+	return b.String()
+}
 
+// summarize folds the previous summary and the archived prefix into one short
+// note. If the summary model fails (503, timeout, empty answer), the chat model
+// is tried once as a backup: a slightly more expensive note is much better than
+// a stub that loses the dialogue.
+func (c *Compactor) summarize(ctx context.Context, prefix []*Message) (string, error) {
+	prompt := c.summarizePrompt(prefix)
+	primary := c.hist.SummaryModel()
+
+	summary, err := c.summarizeWith(ctx, primary, prompt)
+	if err == nil {
+		return summary, nil
+	}
+
+	backup := c.hist.ChatModel()
+	if backup == "" || backup == primary || ctx.Err() != nil {
+		return "", err
+	}
+	if c.trace != nil {
+		c.trace(fmt.Sprintf("сжатие: %s не справился (%s) — пробую %s", primary, oneLine(err.Error()), backup))
+	}
+	summary, err2 := c.summarizeWith(ctx, backup, prompt)
+	if err2 != nil {
+		return "", fmt.Errorf("%s: %v; запасная %s: %v", primary, err, backup, err2)
+	}
+	if c.trace != nil {
+		c.trace(fmt.Sprintf("сжатие выполнено запасной моделью %s", backup))
+	}
+	return summary, nil
+}
+
+// summarizeWith runs one summarizer request on one model under its own timeout.
+func (c *Compactor) summarizeWith(ctx context.Context, model, prompt string) (string, error) {
 	sys := "Ты сжимаешь историю диалога в компактный конспект. Сохрани: что просил пользователь, " +
 		"какие инструменты вызывались и с каким результатом, какие выводы и решения приняты. " +
 		"Пиши по-русски, не более 250 слов, без вступлений и без обращения к пользователю."
 
-	resp, err := c.client.Chat(ctx, c.hist.SummaryModel(), []Message{
+	actx, cancel := context.WithTimeout(ctx, summaryAttemptTimeout)
+	defer cancel()
+	resp, err := c.client.Chat(actx, model, []Message{
 		{Role: "system", Content: sys},
-		{Role: "user", Content: b.String()},
+		{Role: "user", Content: prompt},
 	}, nil, 0)
 	if err != nil {
+		// Our own cap fired, not the caller's deadline: say so, otherwise the
+		// error reads as if the whole turn ran out of time.
+		if actx.Err() != nil && ctx.Err() == nil {
+			return "", fmt.Errorf("%s: таймаут %s", model, summaryAttemptTimeout)
+		}
 		return "", err
 	}
 	summary := strings.TrimSpace(resp.Content)
 	if summary == "" {
-		return "", fmt.Errorf("пустой конспект")
+		return "", fmt.Errorf("%s: пустой конспект", model)
 	}
 	return summary, nil
 }

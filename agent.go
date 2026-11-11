@@ -18,6 +18,13 @@ type Agent struct {
 	temperature        float64
 	maxToolPromptChars int
 	trace              func(string)
+
+	// Streaming callbacks (nil = plain non-stream requests): onMessageStart
+	// before each model request, onContent per streamed delta of the answer,
+	// onMessageDone after each assistant message is complete.
+	onMessageStart func()
+	onContent      func(string)
+	onMessageDone  func()
 }
 
 // NewAgent wires a session, a tool set and a context compactor together.
@@ -43,6 +50,14 @@ func (a *Agent) SetTrace(fn func(string)) {
 	a.comp.trace = fn
 }
 
+// SetStreamUI installs the streaming callbacks. Until it is called the agent
+// uses plain non-stream requests (tests, benchmarks).
+func (a *Agent) SetStreamUI(onStart func(), onContent func(string), onDone func()) {
+	a.onMessageStart = onStart
+	a.onContent = onContent
+	a.onMessageDone = onDone
+}
+
 func (a *Agent) tracef(format string, args ...any) {
 	if a.trace != nil {
 		a.trace(fmt.Sprintf(format, args...))
@@ -65,13 +80,25 @@ func (a *Agent) Chat(ctx context.Context, userText string) (string, error) {
 			estimated += EstimateMessage(m)
 		}
 
-		resp, err := a.client.Chat(ctx, a.hist.ChatModel(), messages, a.tools.Schemas(), a.temperature)
+		if a.onMessageStart != nil {
+			a.onMessageStart()
+		}
+		var resp *ChatResponse
+		var err error
+		if a.onContent != nil {
+			resp, err = a.client.ChatStream(ctx, a.hist.ChatModel(), messages, a.tools.Schemas(), a.temperature, a.onContent)
+		} else {
+			resp, err = a.client.Chat(ctx, a.hist.ChatModel(), messages, a.tools.Schemas(), a.temperature)
+		}
 		if err != nil {
 			return "", err
 		}
 		a.calib.Update(estimated, resp.Usage.PromptTokens)
 
 		a.hist.AppendAssistant(resp.Content, resp.ToolCalls, a.hist.ChatModel())
+		if a.onMessageDone != nil {
+			a.onMessageDone()
+		}
 
 		if len(resp.ToolCalls) == 0 {
 			return resp.Content, nil

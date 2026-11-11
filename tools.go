@@ -58,16 +58,15 @@ func NewToolRegistry(tasks []Task) *ToolRegistry {
 
 	r.add(&Tool{
 		Name:        "find_task",
-		Description: "Ищет задачу в списке задач по названию или условию. Возвращает номер, название и ответ.",
+		Description: "Ищет задачу в списке задач по названию или условию. Возвращает номер, название и ответ. Если пользователь спрашивает, какие задачи есть (список/перечень), или по ключевым словам ничего не нашлось — вызови с пустым query: вернётся весь список.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"query": map[string]any{
 					"type":        "string",
-					"description": "Ключевые слова, например улитка или поезд",
+					"description": "Ключевые слова, например улитка или поезд; пусто — показать все задачи",
 				},
 			},
-			"required":             []string{"query"},
 			"additionalProperties": false,
 		},
 		Run: runFindTask(tasks),
@@ -175,7 +174,7 @@ func runFindTask(tasks []Task) func(json.RawMessage) (string, error) {
 		}
 		q := strings.ToLower(strings.TrimSpace(a.Query))
 		if q == "" {
-			return fmt.Sprintf("в списке %d задач; уточни запрос", len(tasks)), nil
+			return listTasks(tasks), nil
 		}
 
 		hits := matchTasks(tasks, q)
@@ -191,7 +190,7 @@ func runFindTask(tasks []Task) func(json.RawMessage) (string, error) {
 			}
 		}
 		if len(hits) == 0 {
-			return "ничего не найдено", nil
+			return "ничего не найдено; полный список задач — find_task с пустым query", nil
 		}
 
 		var b strings.Builder
@@ -211,6 +210,15 @@ func runFindTask(tasks []Task) func(json.RawMessage) (string, error) {
 		}
 		return strings.TrimRight(b.String(), "\n"), nil
 	}
+}
+
+// listTasks renders the whole task list, one line per task.
+func listTasks(tasks []Task) string {
+	var b strings.Builder
+	for _, t := range tasks {
+		fmt.Fprintf(&b, "%d. %s — ответ %s\n", t.ID, t.Label, formatAnswer(t.Answer))
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func matchTasks(tasks []Task, q string) []Task {

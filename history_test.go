@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -75,6 +76,31 @@ func TestHistoryPersistAndCompact(t *testing.T) {
 	}
 }
 
+func TestSummarizeSessions(t *testing.T) {
+	dir := t.TempDir()
+	h, err := OpenHistory(dir, "s1", "model-a", "model-b", "sys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.AppendUser("привет")
+	h.AppendAssistant("здравствуйте", nil, "model-a")
+	h.SetChatModel("model-c")
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	infos, err := SummarizeSessions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("infos = %d, want 1", len(infos))
+	}
+	if infos[0].ID != "s1" || infos[0].Msgs != 2 || infos[0].ChatModel != "model-c" {
+		t.Errorf("info = %+v", infos[0])
+	}
+}
+
 func TestLatestSession(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := LatestSession(dir); err == nil {
@@ -93,5 +119,84 @@ func TestLatestSession(t *testing.T) {
 	latest, err := LatestSession(dir)
 	if err != nil || latest == "" {
 		t.Fatalf("latest = %q, %v", latest, err)
+	}
+}
+
+func TestSummaryModelSwitchPersists(t *testing.T) {
+	dir := t.TempDir()
+
+	h, err := OpenHistory(dir, "s-sum", "model-a", "model-s1", "sys")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	h.AppendUser("вопрос")
+	h.SetSummaryModel("model-s2")
+	if err := h.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	h2, err := OpenHistory(dir, "s-sum", "", "", "")
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer h2.Close()
+	if h2.ChatModel() != "model-a" {
+		t.Errorf("chat = %q, want model-a", h2.ChatModel())
+	}
+	if h2.SummaryModel() != "model-s2" {
+		t.Errorf("summary = %q, want model-s2", h2.SummaryModel())
+	}
+
+	infos, err := SummarizeSessions(dir)
+	if err != nil {
+		t.Fatalf("summarize: %v", err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(infos))
+	}
+	if infos[0].ChatModel != "model-a" || infos[0].SummaryModel != "model-s2" {
+		t.Errorf("info models = %q/%q, want model-a/model-s2", infos[0].ChatModel, infos[0].SummaryModel)
+	}
+}
+
+func TestPrintSessionLogOffline(t *testing.T) {
+	dir := t.TempDir()
+
+	h, err := OpenHistory(dir, "s-log", "chat-m", "sum-m", "sys")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	h.AppendUser("привет")
+	h.AppendAssistant("", []ToolCall{call("calc", `{"expr":"2+2"}`)}, "chat-m")
+	h.AppendTool("call_1", "calc", "4")
+	h.AppendAssistant("ответ\nвторая строка", nil, "chat-m")
+	h.SetSummaryModel("sum-m2")
+	if err := h.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	var b strings.Builder
+	if err := PrintSessionLog(dir, "s-log", &b); err != nil {
+		t.Fatalf("print: %v", err)
+	}
+	out := b.String()
+	for _, want := range []string{
+		"сессия s-log",
+		"модель chat-m",
+		"сжатие sum-m2",
+		"модель сжатия: sum-m2",
+		"[  1] user      привет",
+		"→ calc(",
+		"← calc: 4",
+		"вторая строка",
+		"всего сообщений: 4",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output misses %q:\n%s", want, out)
+		}
+	}
+
+	if err := PrintSessionLog(dir, "no-such", &b); err == nil {
+		t.Error("expected an error for a missing session")
 	}
 }
