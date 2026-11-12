@@ -22,6 +22,7 @@ type app struct {
 	maxSteps     int
 	temperature  float64
 	maxToolChars int
+	noCompact    bool
 
 	hist  *History
 	agent *Agent
@@ -161,6 +162,7 @@ func main() {
 	temp := flag.Float64("temperature", 0.2, "температура сэмплирования")
 	maxTokens := flag.Int("max-tokens", 4096, "лимит токенов ответа (включая рассуждения reasoning-моделей)")
 	maxToolChars := flag.Int("max-tool-chars", 800, "сколько символов результата инструмента оставлять в промпте")
+	noCompact := flag.Bool("no-compact", false, "отключить авто-сжатие контекста (демо переполнения)")
 	systemFlag := flag.String("system", "", "файл с системным промптом")
 	scriptFlag := flag.String("script", "", "проиграть запросы из файла и выйти")
 	listModels := flag.Bool("list-models", false, "показать список моделей и выйти")
@@ -224,6 +226,7 @@ func main() {
 		maxSteps:     *maxSteps,
 		temperature:  *temp,
 		maxToolChars: *maxToolChars,
+		noCompact:    *noCompact,
 		ui:           &ui{tty: isTerminal(os.Stdout)},
 	}
 
@@ -262,6 +265,7 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	a.agent = NewAgent(a.client, a.tools, h, a.budget, a.maxSteps, a.temperature, a.maxToolChars)
 	a.agent.SetTrace(a.ui.trace)
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
+	a.agent.SetNoCompact(a.noCompact)
 	return nil
 }
 
@@ -362,18 +366,25 @@ func (a *app) ask(text string) {
 }
 
 // footer is the one-line stats line printed after every turn: model, prompt
-// estimate vs budget, active/archive split and accumulated API cost.
+// estimate vs budget, last answer size, active/archive split and accumulated
+// API cost. An overflowing prompt is flagged explicitly.
 func (a *app) footer() {
 	activeMsgs, _, archivedMsgs, _ := a.hist.Stats()
 	extra := ""
 	if a.hist.HasSummary() {
 		extra = fmt.Sprintf(" · конспект ~%d ток", EstimateTokens(a.hist.SummaryText()))
 	}
+	prompt := a.agent.comp.PromptTokens(a.hist.SystemPrompt())
+	over := ""
+	if prompt > a.budget.MaxPromptTokens {
+		over = " · ПЕРЕПОЛНЕНИЕ"
+	}
 	s := a.client.Stats()
-	fmt.Printf("· %s · промпт ~%d/%d ток · актив %d, архив %d сообщ%s · API %d выз., $%.4f\n",
+	fmt.Printf("· %s · промпт ~%d/%d ток · ответ ~%d ток · актив %d, архив %d сообщ%s · API %d выз., $%.4f%s\n",
 		a.hist.ChatModel(),
-		a.agent.comp.PromptTokens(a.hist.SystemPrompt()), a.budget.MaxPromptTokens,
-		activeMsgs, archivedMsgs, extra, s.Calls, s.Cost)
+		prompt, a.budget.MaxPromptTokens,
+		a.agent.LastAnswerTokens(),
+		activeMsgs, archivedMsgs, extra, s.Calls, s.Cost, over)
 }
 
 func (a *app) command(line string) (bool, error) {
@@ -512,7 +523,11 @@ func (a *app) printHistory() {
 		start = len(msgs) - 20
 	}
 	for _, m := range msgs[start:] {
-		fmt.Printf("[%d] %-9s %s\n", m.Seq, m.Role, oneLine(m.Content))
+		tok := m.Tokens
+		if tok == 0 {
+			tok = EstimateMessage(*m)
+		}
+		fmt.Printf("[%d] %-9s ~%-5d ток. %s\n", m.Seq, m.Role, tok, oneLine(m.Content))
 	}
 	if a.hist.HasSummary() {
 		fmt.Println("(плюс конспект предыдущего диалога)")
