@@ -256,3 +256,144 @@ func TestCompactStubNamesBothModels(t *testing.T) {
 		t.Error("messages must be archived even when both summarizers fail")
 	}
 }
+
+func TestMaybeCompactEveryMessageCount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{
+				"message": map[string]any{"role": "assistant", "content": "КОНСПЕКТ"},
+			}},
+			"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+		})
+	}))
+	defer srv.Close()
+
+	client := &ChatClient{baseURL: srv.URL, apiKey: "test", http: srv.Client(), stats: ClientStats{ByModel: map[string]int{}}}
+	h, err := OpenHistory(t.TempDir(), "s", "m", "m", "sys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	// 10 short messages: far below the token budget, so only the count
+	// trigger can fire.
+	seedTurns(t, h, 5)
+
+	comp := NewCompactor(h, client, DefaultBudget(), NewCalibrator(), 800)
+	comp.SetCompactEvery(12)
+	ok, err := comp.MaybeCompact(context.Background(), "sys")
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if ok {
+		t.Fatal("compacted below the message-count trigger")
+	}
+
+	comp.SetCompactEvery(10)
+	ok, err = comp.MaybeCompact(context.Background(), "sys")
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected the message-count trigger to compact")
+	}
+	if h.SummaryText() != "КОНСПЕКТ" {
+		t.Errorf("summary = %q", h.SummaryText())
+	}
+	if n := len(h.Active()); n >= 10 {
+		t.Errorf("active = %d, expected a trimmed window", n)
+	}
+	if len(h.Archived()) == 0 {
+		t.Fatal("nothing archived")
+	}
+	assertNoOrphanTools(t, h.Active())
+
+	// The window is below the trigger again: a second call is a no-op.
+	ok, err = comp.MaybeCompact(context.Background(), "sys")
+	if err != nil {
+		t.Fatalf("second compact: %v", err)
+	}
+	if ok {
+		t.Error("compacted again although the window is below the trigger")
+	}
+}
+
+// TestCompactEveryCountsOnlyNewMessages guards the case where the verbatim
+// tail kept after a compaction is itself at least N messages long: the count
+// trigger must not fire again until N new messages arrive.
+func TestCompactEveryCountsOnlyNewMessages(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{
+				"message": map[string]any{"role": "assistant", "content": "КОНСПЕКТ"},
+			}},
+			"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+		})
+	}))
+	defer srv.Close()
+
+	client := &ChatClient{baseURL: srv.URL, apiKey: "test", http: srv.Client(), stats: ClientStats{ByModel: map[string]int{}}}
+	dir := t.TempDir()
+	h, err := OpenHistory(dir, "s", "m", "m", "sys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	seedTurns(t, h, 5) // 10 messages
+
+	// A tiny tail budget keeps ~6 messages verbatim — more than N below.
+	budget := Budget{MaxPromptTokens: 100000, ReserveOutput: 0, MinTailTokens: 20}
+	comp := NewCompactor(h, client, budget, NewCalibrator(), 800)
+	comp.SetCompactEvery(4)
+
+	ok, err := comp.MaybeCompact(context.Background(), "sys")
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected the count trigger to compact")
+	}
+	if n := len(h.Active()); n < 4 {
+		t.Fatalf("active = %d, want a tail of at least the trigger size", n)
+	}
+
+	// The tail alone is already >= 4 messages, but nothing new arrived.
+	ok, err = comp.MaybeCompact(context.Background(), "sys")
+	if err != nil {
+		t.Fatalf("second compact: %v", err)
+	}
+	if ok {
+		t.Error("compacted again on the same tail without new messages")
+	}
+
+	// Four new messages bring the counter back to N.
+	seedTurns(t, h, 2)
+	ok, err = comp.MaybeCompact(context.Background(), "sys")
+	if err != nil {
+		t.Fatalf("third compact: %v", err)
+	}
+	if !ok {
+		t.Error("expected a compaction after N new messages")
+	}
+	if n := len(h.Active()); n >= 10 {
+		t.Errorf("active = %d, expected the window to shrink", n)
+	}
+	assertNoOrphanTools(t, h.Active())
+
+	// The compaction point survives a restart: replaying the log must not make
+	// the trigger fire again on the tail.
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	h2, err := OpenHistory(dir, "s", "m", "m", "sys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h2.Close()
+	comp2 := NewCompactor(h2, client, budget, NewCalibrator(), 800)
+	comp2.SetCompactEvery(4)
+	if n := comp2.pendingCount(); n != 0 {
+		t.Errorf("pending after reload = %d, want 0", n)
+	}
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -23,6 +24,7 @@ type app struct {
 	temperature  float64
 	maxToolChars int
 	noCompact    bool
+	compactEvery int
 
 	hist  *History
 	agent *Agent
@@ -163,6 +165,7 @@ func main() {
 	maxTokens := flag.Int("max-tokens", 4096, "лимит токенов ответа (включая рассуждения reasoning-моделей)")
 	maxToolChars := flag.Int("max-tool-chars", 800, "сколько символов результата инструмента оставлять в промпте")
 	noCompact := flag.Bool("no-compact", false, "отключить авто-сжатие контекста (демо переполнения)")
+	compactEvery := flag.Int("compact-every", 0, "сжимать историю после каждых N новых сообщений с прошлого сжатия (0 — только по бюджету)")
 	systemFlag := flag.String("system", "", "файл с системным промптом")
 	scriptFlag := flag.String("script", "", "проиграть запросы из файла и выйти")
 	listModels := flag.Bool("list-models", false, "показать список моделей и выйти")
@@ -227,6 +230,7 @@ func main() {
 		temperature:  *temp,
 		maxToolChars: *maxToolChars,
 		noCompact:    *noCompact,
+		compactEvery: *compactEvery,
 		ui:           &ui{tty: isTerminal(os.Stdout)},
 	}
 
@@ -266,6 +270,7 @@ func (a *app) newSession(id, requestedChat, requestedSummary string) error {
 	a.agent.SetTrace(a.ui.trace)
 	a.agent.SetStreamUI(a.ui.rearm, a.ui.content, func() { a.ui.endLine() })
 	a.agent.SetNoCompact(a.noCompact)
+	a.agent.SetCompactEvery(a.compactEvery)
 	return nil
 }
 
@@ -478,6 +483,9 @@ func (a *app) command(line string) (bool, error) {
 	case "/history":
 		a.printHistory()
 
+	case "/context":
+		a.printContext()
+
 	case "/tokens":
 		a.printTokens()
 
@@ -531,6 +539,77 @@ func (a *app) printHistory() {
 	}
 	if a.hist.HasSummary() {
 		fmt.Println("(плюс конспект предыдущего диалога)")
+	}
+}
+
+// printContext shows what the next request will actually carry: the system
+// prompt, the rolling summary, the verbatim tail and the tool schemas, with a
+// token estimate per block. It is the "what did compression do" view.
+func (a *app) printContext() {
+	active := a.hist.Active()
+	base := EstimateTokens(a.hist.SystemPrompt()) + 4
+	sumTok := 0
+	if a.hist.HasSummary() {
+		sumTok = EstimateTokens("Конспект предыдущего диалога:\n"+a.hist.SummaryText()) + 4
+	}
+	histTok := 0
+	for _, m := range active {
+		msg := *m
+		if msg.Role == "tool" {
+			msg.Content = truncate(msg.Content, a.maxToolChars)
+		}
+		histTok += EstimateMessage(msg)
+	}
+	schemas := a.tools.Schemas()
+	names := make([]string, 0, len(schemas))
+	for _, s := range schemas {
+		names = append(names, s.Function.Name)
+	}
+	toolsTok := 0
+	if len(schemas) > 0 {
+		if b, err := json.Marshal(schemas); err == nil {
+			toolsTok = EstimateTokens(string(b))
+		}
+	}
+
+	fmt.Printf("что уходит в модель (сессия %s, модель %s):\n", a.hist.ID(), a.hist.ChatModel())
+	fmt.Printf("  system prompt        ~%d ток.\n", base)
+	if a.hist.HasSummary() {
+		cov := a.hist.SummaryCovers()
+		fmt.Printf("  конспект seq %d..%d   ~%d ток.\n", cov[0], cov[1], sumTok)
+	} else {
+		fmt.Println("  конспект             нет")
+	}
+	if len(active) > 0 {
+		fmt.Printf("  история дословно     ~%d ток. (%d сообщ., seq %d..%d)\n",
+			histTok, len(active), active[0].Seq, active[len(active)-1].Seq)
+	} else {
+		fmt.Println("  история дословно     пусто")
+	}
+	fmt.Printf("  инструменты          ~%d ток. (%s)\n", toolsTok, strings.Join(names, ", "))
+	fmt.Printf("  ─────────────────────────────────────────\n")
+	fmt.Printf("  итого                ~%d ток. из %d (калибровка ×%.2f)\n",
+		a.agent.comp.PromptTokens(a.hist.SystemPrompt()), a.budget.MaxPromptTokens, a.agent.calib.Ratio())
+
+	if a.noCompact {
+		fmt.Println("  авто-сжатие отключено (-no-compact)")
+	} else {
+		limit := a.budget.MaxPromptTokens - a.budget.ReserveOutput
+		if limit < 500 {
+			limit = 500
+		}
+		fmt.Printf("  сжатие начнётся при  %d ток.", limit*85/100)
+		if a.compactEvery > 0 {
+			fmt.Printf(" или %d сообщ.", a.compactEvery)
+		}
+		fmt.Println()
+	}
+
+	if a.hist.HasSummary() {
+		fmt.Println("\nконспект вместо старой истории:")
+		for _, line := range strings.Split(strings.TrimSpace(a.hist.SummaryText()), "\n") {
+			fmt.Println("  " + line)
+		}
 	}
 }
 
@@ -632,6 +711,7 @@ func printHelp() {
   /system          показать системный промпт
   /tools           список инструментов
   /history         последние сообщения активного окна
+  /context         что реально уходит в модель: system, конспект, хвост, tools
   /tokens          токены, архив, конспект, расходы API
   /compact         принудительно сжать контекст
   /recall <текст>  поиск по архиву
