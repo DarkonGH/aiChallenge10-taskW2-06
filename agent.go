@@ -66,6 +66,9 @@ func (a *Agent) SetStreamUI(onStart func(), onContent func(string), onDone func(
 // (and the eventual API failure) can be observed instead of hidden.
 func (a *Agent) SetNoCompact(v bool) { a.noCompact = v }
 
+// SetCompactEvery enables the message-count compaction trigger (0 = off).
+func (a *Agent) SetCompactEvery(n int) { a.comp.SetCompactEvery(n) }
+
 // LastAnswerTokens reports the completion-token usage of the most recent
 // model turn (0 before the first turn).
 func (a *Agent) LastAnswerTokens() int { return a.lastAnswerTokens }

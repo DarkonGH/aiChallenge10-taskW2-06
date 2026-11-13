@@ -37,7 +37,13 @@ type Compactor struct {
 	calib        *Calibrator
 	maxToolChars int
 	trace        func(string)
+	compactEvery int // compact when the window holds this many messages (0 = off)
 }
+
+// SetCompactEvery enables the message-count trigger: the history is compacted
+// once the active window grows to n messages, even if the prompt still fits
+// the budget. n <= 0 restores the budget-only behavior.
+func (c *Compactor) SetCompactEvery(n int) { c.compactEvery = n }
 
 // NewCompactor builds a compactor for one session.
 func NewCompactor(hist *History, client *ChatClient, budget Budget, calib *Calibrator, maxToolChars int) *Compactor {
@@ -67,7 +73,27 @@ func (c *Compactor) PromptTokens(system string) int {
 	return c.calib.Scale(n)
 }
 
-// MaybeCompact compacts until the prompt fits the budget (up to 3 rounds).
+// pendingCount counts the messages added since the last compaction. The
+// verbatim tail kept after a compaction is not part of the summary, so the
+// count cannot be derived from SummaryCovers: it starts at the compaction
+// point instead. Counting the whole window would keep the trigger true on
+// every turn whenever the tail is at least N messages long.
+func (c *Compactor) pendingCount() int {
+	if !c.hist.HasSummary() {
+		return len(c.hist.Active())
+	}
+	n := c.hist.LastSeq() - c.hist.CompactMark()
+	if n < 0 {
+		return 0
+	}
+	return int(n)
+}
+
+// MaybeCompact compacts the window when either trigger fires — whichever
+// comes first: the prompt no longer fits the budget, or compactEvery new
+// messages have accumulated since the last compaction. The budget trigger may
+// need several rounds; the message-count trigger runs at most one, so a small
+// N cannot fold the whole dialogue into the summary in a single turn.
 func (c *Compactor) MaybeCompact(ctx context.Context, system string) (bool, error) {
 	limit := c.budget.MaxPromptTokens - c.budget.ReserveOutput
 	if limit < 500 {
@@ -75,7 +101,9 @@ func (c *Compactor) MaybeCompact(ctx context.Context, system string) (bool, erro
 	}
 	changed := false
 	for i := 0; i < 3; i++ {
-		if c.PromptTokens(system) <= limit*85/100 {
+		byTokens := c.PromptTokens(system) > limit*85/100
+		byCount := c.compactEvery > 0 && c.pendingCount() >= c.compactEvery
+		if !byTokens && !byCount {
 			break
 		}
 		ok, err := c.ForceCompact(ctx, system)
@@ -86,6 +114,9 @@ func (c *Compactor) MaybeCompact(ctx context.Context, system string) (bool, erro
 			break
 		}
 		changed = true
+		if !byTokens {
+			break
+		}
 	}
 	return changed, nil
 }
@@ -222,6 +253,8 @@ func (c *Compactor) summarize(ctx context.Context, prefix []*Message) (string, e
 func (c *Compactor) summarizeWith(ctx context.Context, model, prompt string) (string, error) {
 	sys := "Ты сжимаешь историю диалога в компактный конспект. Сохрани: что просил пользователь, " +
 		"какие инструменты вызывались и с каким результатом, какие выводы и решения приняты. " +
+		"Обязательно выписывай конкретные детали с их значениями — имена, числа, сроки, бюджеты, " +
+		"ограничения, названия: по ним будут задавать вопросы. " +
 		"Пиши по-русски, не более 250 слов, без вступлений и без обращения к пользователю."
 
 	actx, cancel := context.WithTimeout(ctx, summaryAttemptTimeout)

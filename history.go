@@ -51,6 +51,10 @@ type History struct {
 	summaryText   string
 	summaryCovers [2]int64
 	hasSummary    bool
+	// compactMark is the newest seq at the moment of the last compaction. The
+	// verbatim tail kept after a compaction is not part of the summary, so the
+	// count trigger measures new messages from here, not from summaryCovers[1].
+	compactMark int64
 
 	warnf func(format string, args ...any)
 }
@@ -206,6 +210,7 @@ func (h *History) applyCompact(covers [2]int64, summary string) {
 	h.summaryText = summary
 	h.summaryCovers = covers
 	h.hasSummary = true
+	h.compactMark = h.seq
 }
 
 func (h *History) writeEvent(ev Event) error {
@@ -296,6 +301,12 @@ func (h *History) HasSummary() bool { return h.hasSummary }
 
 // SummaryCovers returns the seq range covered by the rolling summary.
 func (h *History) SummaryCovers() [2]int64 { return h.summaryCovers }
+
+// LastSeq returns the seq of the newest message (0 for an empty session).
+func (h *History) LastSeq() int64 { return h.seq }
+
+// CompactMark returns the newest seq at the moment of the last compaction.
+func (h *History) CompactMark() int64 { return h.compactMark }
 
 // SystemPrompt returns the session system prompt.
 func (h *History) SystemPrompt() string { return h.system }
